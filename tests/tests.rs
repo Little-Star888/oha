@@ -1,17 +1,17 @@
 use std::{
     convert::Infallible,
     error::Error as StdError,
+    ffi::OsStr,
     fs::File,
     future::Future,
     io::Write,
-    net::{Ipv6Addr, SocketAddr},
+    net::Ipv6Addr,
     str::FromStr,
-    sync::{Arc, OnceLock, atomic::AtomicU16},
+    sync::{Arc, OnceLock},
 };
 
 use axum::{Router, extract::Path, response::Redirect, routing::get};
 use bytes::Bytes;
-use clap::{CommandFactory, Parser};
 use http::{HeaderMap, Request, Response};
 use http_body_util::BodyExt;
 use http_mitm_proxy::MitmProxy;
@@ -26,14 +26,33 @@ use rstest_reuse::{self, *};
 #[cfg(feature = "http3")]
 mod common;
 
-async fn run<'a>(args: impl Iterator<Item = &'a str>) {
-    let opts = oha::Opts::parse_from(
-        ["oha", "--no-tui", "--output-format", "quiet"]
-            .into_iter()
-            .chain(args),
-    );
+async fn run_command<S: AsRef<OsStr>>(args: impl IntoIterator<Item = S>) {
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_oha"))
+        .args(args)
+        // Keep parallel tests from creating a full runtime per CPU in each child.
+        .env("TOKIO_WORKER_THREADS", "2")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
 
-    oha::run(opts).await.unwrap();
+    assert!(
+        output.status.success(),
+        "oha exited with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+async fn run<S: AsRef<OsStr>>(args: impl IntoIterator<Item = S>) {
+    run_command(
+        ["--no-tui", "--output-format", "quiet"]
+            .map(std::ffi::OsString::from)
+            .into_iter()
+            .chain(args.into_iter().map(|arg| arg.as_ref().to_os_string())),
+    )
+    .await;
 }
 
 #[test]
@@ -56,44 +75,6 @@ fn test_no_color_env_convention() {
     }
 }
 
-#[test]
-fn test_no_color_cli_flag() {
-    let matches = oha::Opts::command()
-        .mut_arg("no_color", |arg| arg.env(None))
-        .try_get_matches_from(["oha", "--no-color", "http://example.com"])
-        .unwrap();
-    assert!(matches.get_flag("no_color"));
-}
-
-#[test]
-fn test_worker_threads_cli_flag() {
-    use clap::Parser;
-
-    // Defaults to the number of physical CPU cores when unset.
-    let opts = oha::Opts::try_parse_from(["oha", "http://example.com"]).unwrap();
-    assert_eq!(opts.worker_threads.get(), num_cpus::get_physical());
-
-    // A positive value is parsed.
-    let opts =
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "4", "http://example.com"]).unwrap();
-    assert_eq!(opts.worker_threads.get(), 4);
-
-    // Zero and negative values are rejected.
-    assert!(
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "0", "http://example.com"]).is_err()
-    );
-    assert!(
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "-1", "http://example.com"]).is_err()
-    );
-}
-
-// Port 5111- is reserved for testing
-static PORT: AtomicU16 = AtomicU16::new(5111);
-
-fn next_port() -> u16 {
-    PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 #[ctor::ctor]
 unsafe fn install_crypto_provider() {
     static INSTALL: OnceLock<()> = OnceLock::new();
@@ -104,22 +85,20 @@ unsafe fn install_crypto_provider() {
     });
 }
 
-async fn bind_port(port: u16) -> tokio::net::TcpListener {
-    let addr = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
-
-    tokio::net::TcpListener::bind(addr).await.unwrap()
-}
-
-async fn bind_port_and_increment() -> (tokio::net::TcpListener, u16) {
-    let port = next_port();
-    let listener = bind_port(port).await;
+async fn bind_port() -> (tokio::net::TcpListener, u16) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
     (listener, port)
 }
 
-async fn bind_port_ipv6(port: u16) -> tokio::net::TcpListener {
-    let addr = SocketAddr::new(std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), port);
-
-    tokio::net::TcpListener::bind(addr).await.unwrap()
+async fn bind_port_ipv6() -> (tokio::net::TcpListener, u16) {
+    let listener = tokio::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (listener, port)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -164,59 +143,71 @@ fn test_all_http_versions(#[case] http_version_param: &str) {}
 async fn get_req(path: &str, args: &[&str]) -> Request<Bytes> {
     let (tx, rx) = kanal::unbounded();
 
-    let port = next_port();
-
     let work_type = http_work_type(args);
-    let listener = bind_port(port).await;
-
-    tokio::spawn(async move {
-        match work_type {
-            HttpWorkType::H2 => loop {
-                let (tcp, _) = listener.accept().await.unwrap();
-                let tx = tx.clone();
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(
-                        TokioIo::new(tcp),
-                        service_fn(move |req: Request<Incoming>| {
-                            let tx = tx.clone();
-                            async move {
-                                let (parts, body) = req.into_parts();
-                                let body_bytes = body.collect().await.unwrap().to_bytes();
-                                let req = Request::from_parts(parts, body_bytes);
-                                tx.send(req).unwrap();
-                                Ok::<_, Infallible>(Response::new("Hello World".to_string()))
-                            }
-                        }),
-                    )
-                    .await;
-            },
-            HttpWorkType::H1 => {
-                let (tcp, _) = listener.accept().await.unwrap();
-                hyper::server::conn::http1::Builder::new()
-                    .serve_connection(
-                        TokioIo::new(tcp),
-                        service_fn(move |req: Request<Incoming>| {
-                            let tx = tx.clone();
-
-                            async move {
-                                let (parts, body) = req.into_parts();
-                                let body_bytes = body.collect().await.unwrap().to_bytes();
-                                let req = Request::from_parts(parts, body_bytes);
-                                tx.send(req).unwrap();
-                                Ok::<_, Infallible>(Response::new("Hello World".to_string()))
-                            }
-                        }),
-                    )
-                    .await
-                    .unwrap();
-            }
-            #[cfg(feature = "http3")]
-            HttpWorkType::H3 => {
-                drop(listener);
-                common::h3_server(tx, port).await.unwrap();
-            }
+    let port = match work_type {
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => {
+            let endpoint = common::bind_h3_server().unwrap();
+            let port = endpoint.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                common::h3_server(tx, endpoint).await.unwrap();
+            });
+            port
         }
-    });
+        HttpWorkType::H1 | HttpWorkType::H2 => {
+            let (listener, port) = bind_port().await;
+            tokio::spawn(async move {
+                match work_type {
+                    HttpWorkType::H2 => loop {
+                        let (tcp, _) = listener.accept().await.unwrap();
+                        let tx = tx.clone();
+                        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                            .serve_connection(
+                                TokioIo::new(tcp),
+                                service_fn(move |req: Request<Incoming>| {
+                                    let tx = tx.clone();
+                                    async move {
+                                        let (parts, body) = req.into_parts();
+                                        let body_bytes = body.collect().await.unwrap().to_bytes();
+                                        let req = Request::from_parts(parts, body_bytes);
+                                        tx.send(req).unwrap();
+                                        Ok::<_, Infallible>(Response::new(
+                                            "Hello World".to_string(),
+                                        ))
+                                    }
+                                }),
+                            )
+                            .await;
+                    },
+                    HttpWorkType::H1 => {
+                        let (tcp, _) = listener.accept().await.unwrap();
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(tcp),
+                                service_fn(move |req: Request<Incoming>| {
+                                    let tx = tx.clone();
+
+                                    async move {
+                                        let (parts, body) = req.into_parts();
+                                        let body_bytes = body.collect().await.unwrap().to_bytes();
+                                        let req = Request::from_parts(parts, body_bytes);
+                                        tx.send(req).unwrap();
+                                        Ok::<_, Infallible>(Response::new(
+                                            "Hello World".to_string(),
+                                        ))
+                                    }
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    #[cfg(feature = "http3")]
+                    HttpWorkType::H3 => unreachable!(),
+                }
+            });
+            port
+        }
+    };
 
     let mut args = args.iter().map(|s| s.to_string()).collect::<Vec<String>>();
     args.push("-n".to_string());
@@ -232,7 +223,7 @@ async fn get_req(path: &str, args: &[&str]) -> Request<Bytes> {
         }
     }
 
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap()
 }
@@ -240,7 +231,7 @@ async fn get_req(path: &str, args: &[&str]) -> Request<Bytes> {
 async fn redirect(n: usize, is_relative: bool, limit: usize) -> bool {
     let (tx, rx) = kanal::unbounded();
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
 
     let app = Router::new().route(
         "/{n}",
@@ -259,14 +250,14 @@ async fn redirect(n: usize, is_relative: bool, limit: usize) -> bool {
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        "--redirect".to_string(),
-        limit.to_string(),
-        format!("http://127.0.0.1:{port}/0"),
+        "-n",
+        "1",
+        "--redirect",
+        &limit.to_string(),
+        &format!("http://127.0.0.1:{port}/0"),
     ];
 
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().is_some()
 }
@@ -283,17 +274,17 @@ async fn get_host_with_connect_to(host: &'static str) -> String {
         }),
     );
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        format!("http://{host}/"),
-        "--connect-to".to_string(),
-        format!("{host}:80:localhost:{port}"),
+        "-n",
+        "1",
+        &format!("http://{host}/"),
+        "--connect-to",
+        &format!("{host}:80:localhost:{port}"),
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap()
 }
@@ -309,19 +300,18 @@ async fn get_host_with_connect_to_ipv6_target(host: &'static str) -> String {
         }),
     );
 
-    let port = next_port();
-    let listener = bind_port_ipv6(port).await;
+    let (listener, port) = bind_port_ipv6().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        format!("http://{host}/"),
-        "--connect-to".to_string(),
-        format!("{host}:80:[::1]:{port}"),
+        "-n",
+        "1",
+        &format!("http://{host}/"),
+        "--connect-to",
+        &format!("{host}:80:[::1]:{port}"),
     ];
 
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap()
 }
@@ -337,17 +327,17 @@ async fn get_host_with_connect_to_ipv6_requested() -> String {
         }),
     );
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        "http://[::1]/".to_string(),
-        "--connect-to".to_string(),
-        format!("[::1]:80:localhost:{port}"),
+        "-n",
+        "1",
+        "http://[::1]/",
+        "--connect-to",
+        &format!("[::1]:80:localhost:{port}"),
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap()
 }
@@ -368,19 +358,19 @@ async fn get_host_with_connect_to_redirect(host: &'static str) -> String {
             }),
         );
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        "-r".to_string(),
-        "10".to_string(),
-        format!("http://{host}/source"),
-        "--connect-to".to_string(),
-        format!("{host}:80:localhost:{port}"),
+        "-n",
+        "1",
+        "-r",
+        "10",
+        &format!("http://{host}/source"),
+        "--connect-to",
+        &format!("{host}:80:localhost:{port}"),
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap()
 }
@@ -396,12 +386,12 @@ async fn test_request_count(args: &[&str]) -> usize {
         }),
     );
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     args.push(format!("http://127.0.0.1:{port}"));
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     let mut count = 0;
     while let Ok(Some(())) = rx.try_recv() {
@@ -431,23 +421,23 @@ async fn distribution_on_two_matching_connect_to(host: &'static str) -> (i32, i3
         }),
     );
 
-    let (listener1, port1) = bind_port_and_increment().await;
+    let (listener1, port1) = bind_port().await;
     tokio::spawn(async { axum::serve(listener1, app1).await });
 
-    let (listener2, port2) = bind_port_and_increment().await;
+    let (listener2, port2) = bind_port().await;
     tokio::spawn(async { axum::serve(listener2, app2).await });
 
     let args = [
-        "--disable-keepalive".to_string(),
-        "-n".to_string(),
-        "100".to_string(),
-        format!("http://{host}/"),
-        "--connect-to".to_string(),
-        format!("{host}:80:localhost:{port1}"),
-        "--connect-to".to_string(),
-        format!("{host}:80:localhost:{port2}"),
+        "--disable-keepalive",
+        "-n",
+        "100",
+        &format!("http://{host}/"),
+        "--connect-to",
+        &format!("{host}:80:localhost:{port1}"),
+        "--connect-to",
+        &format!("{host}:80:localhost:{port2}"),
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     let mut count1 = 0;
     let mut count2 = 0;
@@ -464,7 +454,7 @@ async fn distribution_on_two_matching_connect_to(host: &'static str) -> (i32, i3
 }
 
 #[apply(test_all_http_versions)]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_enable_compression_default(http_version_param: &str) {
     let req = get_req("/", &["--http-version", http_version_param]).await;
     let accept_encoding: Vec<&str> = req
@@ -481,7 +471,7 @@ async fn test_enable_compression_default(http_version_param: &str) {
 }
 
 #[apply(test_all_http_versions)]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_setting_custom_header(http_version_param: &str) {
     let req = get_req(
         "/",
@@ -491,7 +481,7 @@ async fn test_setting_custom_header(http_version_param: &str) {
     assert_eq!(req.headers().get("foo").unwrap().to_str().unwrap(), "bar");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 #[apply(test_all_http_versions)]
 async fn test_setting_accept_header(http_version_param: &str) {
     let req = get_req(
@@ -519,7 +509,7 @@ async fn test_setting_accept_header(http_version_param: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 #[apply(test_all_http_versions)]
 async fn test_setting_body(http_version_param: &str) {
     let req = get_req(
@@ -533,7 +523,7 @@ async fn test_setting_body(http_version_param: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_setting_content_type_header() {
     let req = get_req("/", &["-T", "text/html"]).await;
     assert_eq!(
@@ -559,7 +549,7 @@ async fn test_setting_content_type_header() {
 }
 
 #[apply(test_all_http_versions)]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_setting_basic_auth(http_version_param: &str) {
     let req = get_req(
         "/",
@@ -576,7 +566,7 @@ async fn test_setting_basic_auth(http_version_param: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_setting_host() {
     let req = get_req("/", &["--host", "hatoo.io"]).await;
     assert_eq!(
@@ -594,7 +584,7 @@ async fn test_setting_host() {
     // Use --connect-to instead
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_setting_method() {
     assert_eq!(get_req("/", &[]).await.method(), http::method::Method::GET);
     assert_eq!(
@@ -680,7 +670,7 @@ async fn test_setting_method() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_query() {
     assert_eq!(
         get_req("/index?a=b&c=d", &[]).await.uri().to_string(),
@@ -699,7 +689,7 @@ async fn test_query() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_query_rand_regex() {
     let req = get_req("/[a-z][0-9][a-z]", &["--rand-regex-url"]).await;
     let chars = req
@@ -728,7 +718,7 @@ async fn test_query_rand_regex() {
     assert!(chars[2].is_ascii_lowercase());
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_redirect() {
     for n in 1..=5 {
         assert!(redirect(n, true, 10).await);
@@ -740,7 +730,7 @@ async fn test_redirect() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to() {
     assert_eq!(
         get_host_with_connect_to("invalid.example.org").await,
@@ -748,14 +738,14 @@ async fn test_connect_to() {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_randomness() {
     let (count1, count2) = distribution_on_two_matching_connect_to("invalid.example.org").await;
     assert!(count1 + count2 == 100);
     assert!(count1 >= 10 && count2 >= 10); // should not be too flaky with 100 coin tosses
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_ipv6_target() {
     assert_eq!(
         get_host_with_connect_to_ipv6_target("invalid.example.org").await,
@@ -763,12 +753,12 @@ async fn test_connect_to_ipv6_target() {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_ipv6_requested() {
     assert_eq!(get_host_with_connect_to_ipv6_requested().await, "[::1]")
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_redirect() {
     assert_eq!(
         get_host_with_connect_to_redirect("invalid.example.org").await,
@@ -776,14 +766,10 @@ async fn test_connect_to_redirect() {
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_http_proxy_override() {
     let (tx, rx) = kanal::unbounded();
-    let proxy_port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", proxy_port))
-        .await
-        .unwrap();
+    let (listener, proxy_port) = bind_port().await;
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
@@ -817,24 +803,24 @@ async fn test_connect_to_http_proxy_override() {
             .unwrap();
     });
 
-    let override_port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (_override_listener, override_port) = bind_port().await;
     let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        "-x".to_string(),
-        format!("http://127.0.0.1:{proxy_port}"),
-        "--connect-to".to_string(),
-        format!("example.test:80:127.0.0.1:{override_port}"),
-        "http://example.test/".to_string(),
+        "-n",
+        "1",
+        "-x",
+        &format!("http://127.0.0.1:{proxy_port}"),
+        "--connect-to",
+        &format!("example.test:80:127.0.0.1:{override_port}"),
+        "http://example.test/",
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     let (authority, host) = rx.try_recv().unwrap().unwrap();
     assert_eq!(authority, format!("127.0.0.1:{override_port}"));
     assert_eq!(host, "example.test");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_connect_to_https_proxy_connect_override() {
     let (connect_tx, connect_rx) = kanal::unbounded();
     let (host_tx, host_rx) = kanal::unbounded();
@@ -853,25 +839,24 @@ async fn test_connect_to_https_proxy_connect_override() {
         }
     });
 
-    let (proxy_port, proxy_serve) =
-        bind_proxy_with_recorder(service, false, connect_tx.clone()).await;
+    let (proxy_port, proxy_serve) = bind_proxy(service, false, Some(connect_tx)).await;
 
     tokio::spawn(proxy_serve);
 
-    let override_port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let args = vec![
-        "-n".to_string(),
-        "1".to_string(),
-        "--insecure".to_string(),
-        "-x".to_string(),
-        format!("http://127.0.0.1:{proxy_port}"),
-        "--proxy-header".to_string(),
-        "proxy-authorization: test".to_string(),
-        "--connect-to".to_string(),
-        format!("example.test:443:127.0.0.1:{override_port}"),
-        "https://example.test/".to_string(),
+    let (_override_listener, override_port) = bind_port().await;
+    let args = [
+        "-n",
+        "1",
+        "--insecure",
+        "-x",
+        &format!("http://127.0.0.1:{proxy_port}"),
+        "--proxy-header",
+        "proxy-authorization: test",
+        "--connect-to",
+        &format!("example.test:443:127.0.0.1:{override_port}"),
+        "https://example.test/",
     ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run(args).await;
 
     let connect_target = connect_rx.try_recv().unwrap().unwrap();
     assert_eq!(connect_target, format!("127.0.0.1:{override_port}"));
@@ -879,7 +864,7 @@ async fn test_connect_to_https_proxy_connect_override() {
     assert_eq!(host_header, "example.test");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_ipv6() {
     let (tx, rx) = kanal::unbounded();
 
@@ -891,21 +876,16 @@ async fn test_ipv6() {
         }),
     );
 
-    let port = next_port();
-    let listener = bind_port_ipv6(port).await;
+    let (listener, port) = bind_port_ipv6().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
-    let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        format!("http://[::1]:{port}/"),
-    ];
-    run(args.iter().map(|s| s.as_str())).await;
+    let args = ["-n", "1", &format!("http://[::1]:{port}/")];
+    run(args).await;
 
     rx.try_recv().unwrap().unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_query_limit() {
     // burst 10 requests with delay of 2s and rate of 4
     let mut args = vec!["-n", "10", "--burst-delay", "2s", "--burst-rate", "4"];
@@ -914,13 +894,13 @@ async fn test_query_limit() {
     assert_eq!(test_request_count(args.as_slice()).await, 10);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_query_limit_with_time_limit() {
     // 1.75 qps for 2sec = expect 4 requests at times 0, 0.571, 1.142, 1,714sec
     assert_eq!(test_request_count(&["-z", "2s", "-q", "1.75"]).await, 4);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_worker_threads_fast_mode() {
     // --no-tui fixed-count runs go through the fast-mode workers; pinning the
     // runtime thread count with --worker-threads must not drop any requests.
@@ -930,7 +910,7 @@ async fn test_worker_threads_fast_mode() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_http_versions() {
     assert_eq!(get_req("/", &[]).await.version(), http::Version::HTTP_11);
     assert_eq!(
@@ -949,7 +929,7 @@ async fn test_http_versions() {
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_unix_socket() {
     let (tx, rx) = kanal::unbounded();
 
@@ -975,14 +955,14 @@ async fn test_unix_socket() {
         .unwrap();
     });
 
-    let args = [
-        "-n".to_string(),
-        "1".to_string(),
-        "--unix-socket".to_string(),
-        path.to_str().unwrap().to_string(),
-        "http://unix-socket.invalid-tld/".to_string(),
-    ];
-    run(args.iter().map(|s| s.as_str())).await;
+    run([
+        OsStr::new("-n"),
+        OsStr::new("1"),
+        OsStr::new("--unix-socket"),
+        path.as_os_str(),
+        OsStr::new("http://unix-socket.invalid-tld/"),
+    ])
+    .await;
 
     rx.try_recv().unwrap().unwrap();
 }
@@ -1006,66 +986,10 @@ fn make_root_issuer() -> rcgen::Issuer<'static, rcgen::KeyPair> {
     rcgen::Issuer::new(params, signing_key)
 }
 
-async fn bind_proxy<S>(service: S, http2: bool) -> (u16, impl Future<Output = ()>)
-where
-    S: HttpService<Incoming> + Clone + Send + 'static,
-    S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    S::ResBody: Send + Sync + 'static,
-    <S::ResBody as Body>::Data: Send,
-    <S::ResBody as Body>::Error: Into<Box<dyn StdError + Send + Sync>>,
-    S::Future: Send,
-{
-    let port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .unwrap();
-
-    let issuer = make_root_issuer();
-    let proxy = Arc::new(http_mitm_proxy::MitmProxy::new(Some(issuer), None));
-
-    let serve = async move {
-        let (stream, _) = tcp_listener.accept().await.unwrap();
-
-        let proxy = proxy.clone();
-        let service = service.clone();
-
-        let outer = service_fn(move |req| {
-            // Test --proxy-header option
-            assert_eq!(
-                req.headers()
-                    .get("proxy-authorization")
-                    .unwrap()
-                    .to_str()
-                    .unwrap(),
-                "test"
-            );
-
-            MitmProxy::wrap_service(proxy.clone(), service.clone()).call(req)
-        });
-
-        tokio::spawn(async move {
-            if http2 {
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(stream), outer)
-                    .await;
-            } else {
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(TokioIo::new(stream), outer)
-                    .with_upgrades()
-                    .await;
-            }
-        });
-    };
-
-    (port, serve)
-}
-
-async fn bind_proxy_with_recorder<S>(
+async fn bind_proxy<S>(
     service: S,
     http2: bool,
-    recorder: kanal::Sender<String>,
+    recorder: Option<kanal::Sender<String>>,
 ) -> (u16, impl Future<Output = ()>)
 where
     S: HttpService<Incoming> + Clone + Send + 'static,
@@ -1075,10 +999,7 @@ where
     <S::ResBody as Body>::Error: Into<Box<dyn StdError + Send + Sync>>,
     S::Future: Send,
 {
-    let port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tcp_listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .unwrap();
+    let (tcp_listener, port) = bind_port().await;
 
     let issuer = make_root_issuer();
     let proxy = Arc::new(http_mitm_proxy::MitmProxy::new(Some(issuer), None));
@@ -1088,11 +1009,11 @@ where
 
         let proxy = proxy.clone();
         let service = service.clone();
-        let recorder = recorder.clone();
 
         let outer = service_fn(move |req| {
-            let recorder = recorder.clone();
-            if req.method() == hyper::Method::CONNECT {
+            if req.method() == hyper::Method::CONNECT
+                && let Some(recorder) = &recorder
+            {
                 recorder.send(req.uri().to_string()).unwrap();
             }
 
@@ -1134,6 +1055,7 @@ async fn test_proxy_with_setting(https: bool, http2: bool, proxy_http2: bool) {
             Ok::<_, Infallible>(res)
         }),
         proxy_http2,
+        None,
     )
     .await;
 
@@ -1147,7 +1069,6 @@ async fn test_proxy_with_setting(https: bool, http2: bool, proxy_http2: bool) {
             "--no-tui",
             "-n",
             "1",
-            "--no-tui",
             "--output-format",
             "quiet",
             "--insecure",
@@ -1170,12 +1091,10 @@ async fn test_proxy_with_setting(https: bool, http2: bool, proxy_http2: bool) {
         args.push("--proxy-http2".to_string());
     }
 
-    use clap::Parser;
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args).await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_proxy() {
     for https in [false, true] {
         for http2 in [false, true] {
@@ -1186,30 +1105,31 @@ async fn test_proxy() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_google() {
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
-        "--no-tui".to_string(),
-        "-n".to_string(),
-        "1".to_string(),
-        "https://www.google.com/".to_string(),
-        "--output".to_string(),
-        temp_path.to_str().unwrap().to_string(),
-    ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command([
+        OsStr::new("--no-tui"),
+        OsStr::new("-n"),
+        OsStr::new("1"),
+        OsStr::new("https://www.google.com/"),
+        OsStr::new("--output"),
+        temp_path.as_os_str(),
+    ])
+    .await;
 
     let output = std::fs::read_to_string(&temp_path).unwrap();
     assert!(output.contains("[200] 1 responses\n"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_json_schema() {
+#[rstest]
+#[case::plain(false)]
+#[case::success_breakdown(true)]
+#[tokio::test]
+async fn test_json_schema(#[case] success_breakdown: bool) {
     let app = Router::new().route("/", get(|| async move { "Hello World" }));
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     const SCHEMA: &str = include_str!("../schema.json");
@@ -1217,79 +1137,51 @@ async fn test_json_schema() {
     let validator = jsonschema::validator_for(&schema_value).unwrap();
 
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
-        "--no-tui".to_string(),
-        "-n".to_string(),
-        "10".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        format!("http://127.0.0.1:{port}/"),
-        "--output".to_string(),
-        temp_path.to_str().unwrap().to_string(),
+    let url = format!("http://127.0.0.1:{port}/");
+    let mut args = vec![
+        OsStr::new("--no-tui"),
+        OsStr::new("-n"),
+        OsStr::new("10"),
+        OsStr::new("--output-format"),
+        OsStr::new("json"),
+        OsStr::new(&url),
+        OsStr::new("--output"),
+        temp_path.as_os_str(),
     ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    if success_breakdown {
+        args.push(OsStr::new("--stats-success-breakdown"));
+    }
+    run_command(args).await;
 
     let output_json = std::fs::read_to_string(&temp_path).unwrap();
-
-    let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
-        "--no-tui".to_string(),
-        "-n".to_string(),
-        "10".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--stats-success-breakdown".to_string(),
-        format!("http://127.0.0.1:{port}/"),
-        "--output".to_string(),
-        temp_path.to_str().unwrap().to_string(),
-    ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
-    let output_json_stats_success_breakdown = std::fs::read_to_string(&temp_path).unwrap();
-
     let value: serde_json::Value = serde_json::from_str(&output_json).unwrap();
-    let value_stats_success_breakdown: serde_json::Value =
-        serde_json::from_str(&output_json_stats_success_breakdown).unwrap();
-
     if validator.validate(&value).is_err() {
         for error in validator.iter_errors(&value) {
             eprintln!("{error}");
         }
         panic!("JSON schema validation failed\n{output_json}");
     }
-
-    if validator.validate(&value_stats_success_breakdown).is_err() {
-        for error in validator.iter_errors(&value_stats_success_breakdown) {
-            eprintln!("{error}");
-        }
-        panic!("JSON schema validation failed\n{output_json_stats_success_breakdown}");
-    }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_csv_output() {
     let app = Router::new().route("/", get(|| async move { "Hello World" }));
 
-    let (listener, port) = bind_port_and_increment().await;
+    let (listener, port) = bind_port().await;
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
-        "--no-tui".to_string(),
-        "-n".to_string(),
-        "5".to_string(),
-        "--output-format".to_string(),
-        "csv".to_string(),
-        format!("http://127.0.0.1:{port}/"),
-        "--output".to_string(),
-        temp_path.to_str().unwrap().to_string(),
-    ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command([
+        OsStr::new("--no-tui"),
+        OsStr::new("-n"),
+        OsStr::new("5"),
+        OsStr::new("--output-format"),
+        OsStr::new("csv"),
+        OsStr::new(&format!("http://127.0.0.1:{port}/")),
+        OsStr::new("--output"),
+        temp_path.as_os_str(),
+    ])
+    .await;
     let output_csv = std::fs::read_to_string(&temp_path).unwrap();
 
     // Validate that we get CSV output in following format,
@@ -1324,8 +1216,9 @@ async fn test_csv_output() {
 fn setup_mtls_server(
     dir: std::path::PathBuf,
 ) -> (u16, impl Future<Output = Result<(), std::io::Error>>) {
-    let port = PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
 
     // build our application with a route
     let app = Router::new()
@@ -1383,33 +1276,34 @@ fn setup_mtls_server(
 
     (
         port,
-        axum_server::bind_rustls(addr, config).serve(app.into_make_service()),
+        axum_server::from_tcp_rustls(listener, config)
+            .unwrap()
+            .serve(app.into_make_service()),
     )
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_mtls() {
     let dir = tempfile::tempdir().unwrap();
     let (port, server) = setup_mtls_server(dir.path().to_path_buf());
 
     tokio::spawn(server);
 
-    let args = vec![
-        "-n".to_string(),
-        "1".to_string(),
-        "--cacert".to_string(),
-        dir.path().join("server.crt").to_string_lossy().to_string(),
-        "--cert".to_string(),
-        dir.path().join("client.crt").to_string_lossy().to_string(),
-        "--key".to_string(),
-        dir.path().join("client.key").to_string_lossy().to_string(),
-        format!("https://localhost:{port}/"),
-    ];
-
-    run(args.iter().map(|s| s.as_str())).await;
+    run([
+        OsStr::new("-n"),
+        OsStr::new("1"),
+        OsStr::new("--cacert"),
+        dir.path().join("server.crt").as_os_str(),
+        OsStr::new("--cert"),
+        dir.path().join("client.crt").as_os_str(),
+        OsStr::new("--key"),
+        dir.path().join("client.key").as_os_str(),
+        OsStr::new(&format!("https://localhost:{port}/")),
+    ])
+    .await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_body_path_lines() {
     let body = "0\n1\n2";
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
