@@ -10,26 +10,11 @@ use h3_quinn::quinn::{self, crypto::rustls::QuicServerConfig};
 
 static ALPN: &[u8] = b"h3";
 
-// This would be much cleaner if it took `process_request` as a callback, similar to the hyper service_fn.
-pub async fn h3_server(
-    tx: Sender<Request<Bytes>>,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listen = SocketAddr::new("127.0.0.1".parse().unwrap(), port);
-
-    // Get the directory of the current file
-    let current_file = file!();
-    let current_dir = std::path::Path::new(current_file)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new(""));
-
-    // Construct paths to cert and key files
-    let cert_path = current_dir.join("server.cert");
-    let key_path = current_dir.join("server.key");
-
-    // both cert and key must be DER-encoded
-    let cert = CertificateDer::from(std::fs::read(&cert_path)?);
-    let key = PrivateKeyDer::try_from(std::fs::read(&key_path)?)?;
+pub fn bind_h3_server() -> Result<quinn::Endpoint, Box<dyn std::error::Error>> {
+    let listen = SocketAddr::from(([127, 0, 0, 1], 0));
+    // Both cert and key are DER-encoded.
+    let cert = CertificateDer::from(include_bytes!("server.cert").to_vec());
+    let key = PrivateKeyDer::try_from(include_bytes!("server.key").to_vec())?;
 
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -43,8 +28,14 @@ pub async fn h3_server(
 
     let server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
-    let endpoint = quinn::Endpoint::server(server_config, listen)?;
+    Ok(quinn::Endpoint::server(server_config, listen)?)
+}
 
+// This would be much cleaner if it took `process_request` as a callback, similar to the hyper service_fn.
+pub async fn h3_server(
+    tx: Sender<Request<Bytes>>,
+    endpoint: quinn::Endpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
     // handle incoming connections and requests
     while let Some(new_conn) = endpoint.accept().await {
         let tx = tx.clone();
