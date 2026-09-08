@@ -11,7 +11,6 @@ use std::{
 
 use axum::{Router, extract::Path, response::Redirect, routing::get};
 use bytes::Bytes;
-use clap::{CommandFactory, Parser};
 use http::{HeaderMap, Request, Response};
 use http_body_util::BodyExt;
 use http_mitm_proxy::MitmProxy;
@@ -26,14 +25,32 @@ use rstest_reuse::{self, *};
 #[cfg(feature = "http3")]
 mod common;
 
+async fn run_command<'a>(args: impl IntoIterator<Item = &'a str>) {
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_oha"))
+        .args(args)
+        // Keep parallel tests from creating a full runtime per CPU in each child.
+        .env("TOKIO_WORKER_THREADS", "2")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "oha exited with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 async fn run<'a>(args: impl Iterator<Item = &'a str>) {
-    let opts = oha::Opts::parse_from(
-        ["oha", "--no-tui", "--output-format", "quiet"]
+    run_command(
+        ["--no-tui", "--output-format", "quiet"]
             .into_iter()
             .chain(args),
-    );
-
-    oha::run(opts).await.unwrap();
+    )
+    .await;
 }
 
 #[test]
@@ -54,37 +71,6 @@ fn test_no_color_env_convention() {
 
         assert!(status.success());
     }
-}
-
-#[test]
-fn test_no_color_cli_flag() {
-    let matches = oha::Opts::command()
-        .mut_arg("no_color", |arg| arg.env(None))
-        .try_get_matches_from(["oha", "--no-color", "http://example.com"])
-        .unwrap();
-    assert!(matches.get_flag("no_color"));
-}
-
-#[test]
-fn test_worker_threads_cli_flag() {
-    use clap::Parser;
-
-    // Defaults to the number of physical CPU cores when unset.
-    let opts = oha::Opts::try_parse_from(["oha", "http://example.com"]).unwrap();
-    assert_eq!(opts.worker_threads.get(), num_cpus::get_physical());
-
-    // A positive value is parsed.
-    let opts =
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "4", "http://example.com"]).unwrap();
-    assert_eq!(opts.worker_threads.get(), 4);
-
-    // Zero and negative values are rejected.
-    assert!(
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "0", "http://example.com"]).is_err()
-    );
-    assert!(
-        oha::Opts::try_parse_from(["oha", "--worker-threads", "-1", "http://example.com"]).is_err()
-    );
 }
 
 // Port 5111- is reserved for testing
@@ -1147,7 +1133,6 @@ async fn test_proxy_with_setting(https: bool, http2: bool, proxy_http2: bool) {
             "--no-tui",
             "-n",
             "1",
-            "--no-tui",
             "--output-format",
             "quiet",
             "--insecure",
@@ -1170,9 +1155,7 @@ async fn test_proxy_with_setting(https: bool, http2: bool, proxy_http2: bool) {
         args.push("--proxy-http2".to_string());
     }
 
-    use clap::Parser;
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args.iter().map(String::as_str)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1189,8 +1172,7 @@ async fn test_proxy() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_google() {
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
+    let args = [
         "--no-tui".to_string(),
         "-n".to_string(),
         "1".to_string(),
@@ -1198,8 +1180,7 @@ async fn test_google() {
         "--output".to_string(),
         temp_path.to_str().unwrap().to_string(),
     ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args.iter().map(String::as_str)).await;
 
     let output = std::fs::read_to_string(&temp_path).unwrap();
     assert!(output.contains("[200] 1 responses\n"));
@@ -1217,8 +1198,7 @@ async fn test_json_schema() {
     let validator = jsonschema::validator_for(&schema_value).unwrap();
 
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
+    let args = [
         "--no-tui".to_string(),
         "-n".to_string(),
         "10".to_string(),
@@ -1228,14 +1208,12 @@ async fn test_json_schema() {
         "--output".to_string(),
         temp_path.to_str().unwrap().to_string(),
     ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args.iter().map(String::as_str)).await;
 
     let output_json = std::fs::read_to_string(&temp_path).unwrap();
 
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
+    let args = [
         "--no-tui".to_string(),
         "-n".to_string(),
         "10".to_string(),
@@ -1246,8 +1224,7 @@ async fn test_json_schema() {
         "--output".to_string(),
         temp_path.to_str().unwrap().to_string(),
     ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args.iter().map(String::as_str)).await;
     let output_json_stats_success_breakdown = std::fs::read_to_string(&temp_path).unwrap();
 
     let value: serde_json::Value = serde_json::from_str(&output_json).unwrap();
@@ -1277,8 +1254,7 @@ async fn test_csv_output() {
     tokio::spawn(async { axum::serve(listener, app).await });
 
     let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let args = vec![
-        "oha".to_string(),
+    let args = [
         "--no-tui".to_string(),
         "-n".to_string(),
         "5".to_string(),
@@ -1288,8 +1264,7 @@ async fn test_csv_output() {
         "--output".to_string(),
         temp_path.to_str().unwrap().to_string(),
     ];
-    let opts = oha::Opts::try_parse_from(args).unwrap();
-    oha::run(opts).await.unwrap();
+    run_command(args.iter().map(String::as_str)).await;
     let output_csv = std::fs::read_to_string(&temp_path).unwrap();
 
     // Validate that we get CSV output in following format,
